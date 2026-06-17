@@ -18,14 +18,15 @@ config.qemu-run.yaml
 *.fd
 *.serial.log
 
-# Build output
+# Build output (repo-root binaries only — leading slash so the cmd/multirunner
+# and cmd/cacheserver source packages are NOT ignored)
 /dist/
 /bin/
-multirunner
-multirunner.exe
-multirunner-linux
-cacheserver
-cacheserver.exe
+/multirunner
+/multirunner.exe
+/multirunner-linux
+/cacheserver
+/cacheserver.exe
 
 # Logs
 *.log
@@ -38,5 +39,5 @@ cacheserver.exe
 .claude/
 
 # more binaries
-cacheserver-linux
-cacheserver-*
+/cacheserver-linux
+/cacheserver-*
