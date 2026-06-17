@@ -79,11 +79,21 @@ Prebuilt binaries are published for **Linux, Windows, and macOS**, each in
 
 ## Quick start (Linux)
 
-1. **Build the runner image** (build context = repo root):
+1. **Get a runner image.** Pull the prebuilt one:
+
+   ```sh
+   docker pull gerardsmit/multirunner-runner-linux:latest
+   ```
+
+   …or build it yourself (build context = repo root):
 
    ```sh
    docker build -f images/linux/Dockerfile -t multirunner/runner-linux:dev .
    ```
+
+   Published images (built + pushed by CI on each release):
+   `gerardsmit/multirunner-runner-linux`, `gerardsmit/multirunner-runner-windows`,
+   `gerardsmit/multirunner-cacheserver` — Linux images are multi-arch (amd64 + arm64).
 
 2. **Connect to GitHub.** `connect` creates and installs a GitHub App for your
    org/repo via a browser flow and writes the credentials to your config — no

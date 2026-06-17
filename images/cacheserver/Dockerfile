@@ -1,10 +1,19 @@
-# Standalone multirunner cache server image.
-# Build context = repo root, after cross-compiling bin/cacheserver-linux:
-#   GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o bin/cacheserver-linux ./cmd/cacheserver
-#   docker build -f images/cacheserver/Dockerfile -t multirunner/cacheserver:dev .
+# Standalone multirunner cache server image (multi-arch).
+# Build context = repo root:
+#   docker buildx build -f images/cacheserver/Dockerfile --platform linux/amd64,linux/arm64 .
+FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+ARG TARGETOS
+ARG TARGETARCH
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
+    go build -trimpath -ldflags "-s -w" -o /cacheserver ./cmd/cacheserver
+
 FROM alpine:3.20
 RUN apk add --no-cache ca-certificates
-COPY bin/cacheserver-linux /cacheserver
+COPY --from=build /cacheserver /cacheserver
 VOLUME /data
 EXPOSE 3000
 ENTRYPOINT ["/cacheserver"]

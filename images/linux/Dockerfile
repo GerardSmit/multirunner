@@ -8,12 +8,19 @@ ARG BASE=mcr.microsoft.com/dotnet/runtime-deps:8.0-noble
 
 FROM ${BASE} AS build
 ARG RUNNER_VERSION=2.335.0
-ARG RUNNER_ARCH=x64
+# TARGETARCH is supplied automatically by buildx (amd64|arm64); map it to the
+# runner's release arch name so multi-arch builds fetch the right tarball.
+ARG TARGETARCH
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update -y && apt-get install -y --no-install-recommends curl ca-certificates perl \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /actions-runner
-RUN curl -fsSL -o runner.tar.gz \
+RUN case "${TARGETARCH:-amd64}" in \
+        amd64) RUNNER_ARCH=x64 ;; \
+        arm64) RUNNER_ARCH=arm64 ;; \
+        *)     RUNNER_ARCH="${TARGETARCH}" ;; \
+    esac \
+    && curl -fsSL -o runner.tar.gz \
       "https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-${RUNNER_ARCH}-${RUNNER_VERSION}.tar.gz" \
     && tar xzf runner.tar.gz \
     && rm runner.tar.gz
