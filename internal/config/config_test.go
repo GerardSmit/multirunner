@@ -1,0 +1,218 @@
+package config
+
+import (
+	"os"
+	"path/filepath"
+	"testing"
+)
+
+func writeConfig(t *testing.T, body string) string {
+	t.Helper()
+	dir := t.TempDir()
+	p := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+func TestLoadDefaults(t *testing.T) {
+	p := writeConfig(t, `
+github:
+  scope: org
+  owner: myorg
+auth:
+  pat: ghp_x
+pools:
+  - name: linux-pool
+    os: linux
+    docker:
+      host: tcp://127.0.0.1:2375
+`)
+	c, err := Load(p)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if c.GitHub.URL != "https://github.com" {
+		t.Errorf("default url = %q", c.GitHub.URL)
+	}
+	if c.Provisioning != ProvisioningPool {
+		t.Errorf("default provisioning = %q", c.Provisioning)
+	}
+	p0 := c.Pools[0]
+	if p0.Size != 1 || p0.WorkFolder != "_work" || p0.NamePrefix != "multirunner" || p0.RunnerGroupID != 1 {
+		t.Errorf("pool defaults not applied: %+v", p0)
+	}
+	if p0.ImageTier != "minimal" || p0.MaxConsecutiveFailures != 5 {
+		t.Errorf("pool defaults not applied: %+v", p0)
+	}
+}
+
+func TestValidateErrors(t *testing.T) {
+	cases := map[string]string{
+		"repo without repo": `
+github: {scope: repo, owner: o}
+auth: {pat: x}
+pools: [{name: p, os: linux, docker: {host: h}}]`,
+		"no auth": `
+github: {scope: org, owner: o}
+auth: {}
+pools: [{name: p, os: linux, docker: {host: h}}]`,
+		"bad scope": `
+github: {scope: user, owner: o}
+auth: {pat: x}
+pools: [{name: p, os: linux, docker: {host: h}}]`,
+		"no pools": `
+github: {scope: org, owner: o}
+auth: {pat: x}
+pools: []`,
+		"bad os": `
+github: {scope: org, owner: o}
+auth: {pat: x}
+pools: [{name: p, os: bsd, docker: {host: h}}]`,
+		"dup pool": `
+github: {scope: org, owner: o}
+auth: {pat: x}
+pools:
+  - {name: p, os: linux, docker: {host: h}}
+  - {name: p, os: windows, docker: {host: h2}}`,
+	}
+	for name, body := range cases {
+		t.Run(name, func(t *testing.T) {
+			if _, err := Load(writeConfig(t, body)); err == nil {
+				t.Errorf("expected validation error for %q", name)
+			}
+		})
+	}
+}
+
+func TestPATEnvExpansion(t *testing.T) {
+	t.Setenv("MR_TEST_PAT", "ghp_fromenv")
+	p := writeConfig(t, `
+github: {scope: org, owner: o}
+auth: {pat: "${MR_TEST_PAT}"}
+pools: [{name: p, os: linux, docker: {host: h}}]`)
+	c, err := Load(p)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if c.Auth.PAT != "ghp_fromenv" {
+		t.Errorf("PAT = %q, want ghp_fromenv", c.Auth.PAT)
+	}
+}
+
+func TestPATLiteralUnchanged(t *testing.T) {
+	if got := expandEnvRef("ghp_literal"); got != "ghp_literal" {
+		t.Errorf("expandEnvRef(literal) = %q", got)
+	}
+}
+
+func TestImageRef(t *testing.T) {
+	cases := []struct {
+		os, tier, explicit, want string
+	}{
+		{"linux", "minimal", "", "multirunner/runner-linux:dev"},
+		{"linux", "", "", "multirunner/runner-linux:dev"},
+		{"linux", "github-like", "", "multirunner/runner-linux-github-like:dev"},
+		{"windows", "minimal", "", "multirunner/runner-windows:dev"},
+		{"linux", "minimal", "ghcr.io/me/x:1", "ghcr.io/me/x:1"},
+	}
+	for _, c := range cases {
+		p := Pool{OS: c.os, ImageTier: c.tier, Image: c.explicit}
+		if got := p.ImageRef(); got != c.want {
+			t.Errorf("ImageRef(os=%s tier=%s explicit=%s) = %q, want %q", c.os, c.tier, c.explicit, got, c.want)
+		}
+	}
+}
+
+func TestToolCachePath(t *testing.T) {
+	if got := (Pool{OS: "linux"}).ToolCachePath(); got != "/opt/hostedtoolcache" {
+		t.Errorf("linux tool cache = %q", got)
+	}
+	if got := (Pool{OS: "windows"}).ToolCachePath(); got != `C:\hostedtoolcache\windows` {
+		t.Errorf("windows tool cache = %q", got)
+	}
+}
+
+func TestGitCacheEnabled(t *testing.T) {
+	if (GitCache{Mode: "off"}).Enabled() {
+		t.Error("off should be disabled")
+	}
+	if (GitCache{Mode: "mirror"}).Enabled() {
+		t.Error("mirror without path should be disabled")
+	}
+	if !(GitCache{Mode: "mirror", Path: "/x"}).Enabled() {
+		t.Error("mirror with path should be enabled")
+	}
+}
+
+func TestWriteAppAuth(t *testing.T) {
+	p := writeConfig(t, `
+github:
+  url: https://github.com
+  scope: org
+  owner: oldorg
+auth:
+  pat: ghp_old
+pools:
+  - {name: linux-pool, os: linux, docker: {host: tcp://127.0.0.1:2375}}
+`)
+	if err := WriteAppAuth(p, ScopeOrg, "neworg", "", 111, 222, "/keys/app.pem"); err != nil {
+		t.Fatalf("WriteAppAuth: %v", err)
+	}
+	c, err := Load(p)
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if c.Auth.PAT != "" {
+		t.Errorf("pat not removed: %q", c.Auth.PAT)
+	}
+	if !c.Auth.IsApp() || c.Auth.AppID != 111 || c.Auth.InstallationID != 222 || c.Auth.PrivateKeyPath != "/keys/app.pem" {
+		t.Errorf("app auth not written: %+v", c.Auth)
+	}
+	if c.GitHub.Owner != "neworg" || c.GitHub.Scope != ScopeOrg {
+		t.Errorf("github not updated: %+v", c.GitHub)
+	}
+	if len(c.Pools) != 1 || c.Pools[0].Name != "linux-pool" {
+		t.Errorf("pools not preserved: %+v", c.Pools)
+	}
+}
+
+func TestWriteAppAuthCreatesFile(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "new.yaml")
+	if err := WriteAppAuth(p, ScopeRepo, "octo", "hello", 1, 2, "/k.pem"); err != nil {
+		t.Fatalf("WriteAppAuth: %v", err)
+	}
+	// File now has github+auth but no pools yet; validate the auth/github pieces directly.
+	data, _ := os.ReadFile(p)
+	for _, want := range []string{"app_id", "installation_id", "private_key_path", "octo", "hello"} {
+		if !contains(string(data), want) {
+			t.Errorf("written config missing %q:\n%s", want, data)
+		}
+	}
+}
+
+func contains(s, sub string) bool { return len(s) >= len(sub) && (indexOf(s, sub) >= 0) }
+func indexOf(s, sub string) int {
+	for i := 0; i+len(sub) <= len(s); i++ {
+		if s[i:i+len(sub)] == sub {
+			return i
+		}
+	}
+	return -1
+}
+
+func TestAppAuthValid(t *testing.T) {
+	p := writeConfig(t, `
+github: {scope: enterprise, owner: ent}
+auth: {app_id: 1, installation_id: 2, private_key_path: /tmp/k.pem}
+pools: [{name: p, os: linux, docker: {host: h}}]`)
+	c, err := Load(p)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !c.Auth.IsApp() {
+		t.Error("IsApp = false, want true")
+	}
+}

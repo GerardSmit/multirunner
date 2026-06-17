@@ -1,0 +1,42 @@
+# Local config holding secrets / machine-specific settings
+config.local.yaml
+config.yaml
+config.qemu-run.yaml
+
+# Secrets
+*.pem
+
+# Cache / mirror data dirs
+/cache/
+/gitmirror/
+
+# VM build artifacts (ISOs, golden images, firmware/NVRAM)
+/vmbuild/
+*.iso
+*.qcow2
+*.vars.fd
+*.fd
+*.serial.log
+
+# Build output
+/dist/
+/bin/
+multirunner
+multirunner.exe
+multirunner-linux
+cacheserver
+cacheserver.exe
+
+# Logs
+*.log
+
+# OS / editor
+.DS_Store
+*.swp
+
+# Claude / agent state
+.claude/
+
+# more binaries
+cacheserver-linux
+cacheserver-*
