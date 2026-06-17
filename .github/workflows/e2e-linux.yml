@@ -1,9 +1,11 @@
 # Full Linux E2E: boot multirunner on a GitHub-hosted runner, have it provision
-# an ephemeral self-hosted runner against THIS repo, dispatch the e2e-target
-# workload, and assert the job runs to success.
+# an ephemeral self-hosted runner against the target repo, dispatch a workload,
+# and assert the job runs to success.
 #
-# Requires a repo secret MR_E2E_PAT — a token with Administration:write (register
-# runners) + Actions:write (dispatch) on this repo. Manual trigger only.
+# Requires secret MR_E2E_PAT — a token with Administration:write (register
+# runners) + Actions:write (dispatch) on the TARGET repo. Manual trigger only.
+# Target defaults to this repo (e2e-target.yml); override with repo variables
+# E2E_REPO (e.g. GerardSandbox/mr-win-e2e) and E2E_WORKFLOW (e.g. ci-linux.yml).
 name: e2e-linux
 
 on:
@@ -14,7 +16,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
-      REPO: ${{ github.repository }}
+      # Target repo + workload to drive. Default to THIS repo's e2e-target; set
+      # repo variables E2E_REPO / E2E_WORKFLOW to point at another repo (e.g. a
+      # sandbox the secret PAT is scoped to) and its self-hosted-linux workflow.
+      REPO: ${{ vars.E2E_REPO || github.repository }}
+      WORKFLOW: ${{ vars.E2E_WORKFLOW || 'e2e-target.yml' }}
       GITHUB_PAT: ${{ secrets.MR_E2E_PAT }}
       GH_TOKEN: ${{ secrets.MR_E2E_PAT }}
       IMAGE: gerardsmit/multirunner-runner-linux:latest
@@ -74,7 +80,7 @@ jobs:
           api() { curl -fsSL -H "Authorization: Bearer ${GITHUB_PAT}" -H "X-GitHub-Api-Version: 2022-11-28" "$@"; }
 
           # Baseline: newest existing e2e-target run id (so we can detect the new one).
-          before=$(api "https://api.github.com/repos/${REPO}/actions/workflows/e2e-target.yml/runs?per_page=1" | jq -r '.workflow_runs[0].id // 0')
+          before=$(api "https://api.github.com/repos/${REPO}/actions/workflows/${WORKFLOW}/runs?per_page=1" | jq -r '.workflow_runs[0].id // 0')
           echo "baseline e2e-target run id: $before"
 
           # Start the orchestrator.
@@ -94,14 +100,14 @@ jobs:
           if [ "${online:-0}" -lt 1 ]; then echo "::error::no runner came online"; exit 1; fi
 
           # Dispatch the workload.
-          api -X POST "https://api.github.com/repos/${REPO}/actions/workflows/e2e-target.yml/dispatches" \
+          api -X POST "https://api.github.com/repos/${REPO}/actions/workflows/${WORKFLOW}/dispatches" \
             -d '{"ref":"main"}'
-          echo "dispatched e2e-target"
+          echo "dispatched ${WORKFLOW} on ${REPO}"
 
           # Find the new run.
           runid=0
           for i in $(seq 1 24); do
-            runid=$(api "https://api.github.com/repos/${REPO}/actions/workflows/e2e-target.yml/runs?per_page=1" | jq -r '.workflow_runs[0].id // 0')
+            runid=$(api "https://api.github.com/repos/${REPO}/actions/workflows/${WORKFLOW}/runs?per_page=1" | jq -r '.workflow_runs[0].id // 0')
             [ "$runid" != "$before" ] && [ "$runid" != "0" ] && break
             sleep 5
           done
