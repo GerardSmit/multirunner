@@ -1,0 +1,17 @@
+# E2E workload — runs ONLY on a multirunner-provisioned self-hosted runner.
+# Dispatched by the e2e-linux workflow; never runs on GitHub-hosted runners.
+name: e2e-target
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: [self-hosted, linux, x64]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prove the job ran on a multirunner runner
+        run: |
+          echo "runner: $RUNNER_NAME"
+          echo "os: $(uname -a)"
+          test -f README.md && echo "checkout OK"

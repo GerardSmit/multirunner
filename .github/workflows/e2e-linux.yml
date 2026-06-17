@@ -1,0 +1,123 @@
+# Full Linux E2E: boot multirunner on a GitHub-hosted runner, have it provision
+# an ephemeral self-hosted runner against THIS repo, dispatch the e2e-target
+# workload, and assert the job runs to success.
+#
+# Requires a repo secret MR_E2E_PAT — a token with Administration:write (register
+# runners) + Actions:write (dispatch) on this repo. Manual trigger only.
+name: e2e-linux
+
+on:
+  workflow_dispatch:
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      REPO: ${{ github.repository }}
+      GITHUB_PAT: ${{ secrets.MR_E2E_PAT }}
+      GH_TOKEN: ${{ secrets.MR_E2E_PAT }}
+      IMAGE: gerardsmit/multirunner-runner-linux:latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Guard — secret present
+        run: |
+          if [ -z "${GITHUB_PAT}" ]; then
+            echo "::error::MR_E2E_PAT secret is not set; add it to run this E2E."
+            exit 1
+          fi
+
+      - name: Build multirunner
+        run: go build -o multirunner ./cmd/multirunner
+
+      - name: Pull runner image
+        run: docker pull "$IMAGE"
+
+      - name: Write config
+        run: |
+          owner="${REPO%/*}"; repo="${REPO#*/}"
+          cat > e2e.yaml <<EOF
+          github:
+            scope: repo
+            owner: ${owner}
+            repo: ${repo}
+          auth:
+            pat: "\${GITHUB_PAT}"
+          provisioning: pool
+          cache:
+            enabled: false
+          git_cache:
+            mode: "off"
+          pools:
+            - name: linux
+              os: linux
+              size: 1
+              image: "${IMAGE}"
+              labels: [self-hosted, linux, x64]
+              docker:
+                host: "unix:///var/run/docker.sock"
+          log:
+            level: debug
+            format: text
+          EOF
+          cat e2e.yaml
+
+      - name: Run E2E
+        run: |
+          set -euo pipefail
+          api() { curl -fsSL -H "Authorization: Bearer ${GITHUB_PAT}" -H "X-GitHub-Api-Version: 2022-11-28" "$@"; }
+
+          # Baseline: newest existing e2e-target run id (so we can detect the new one).
+          before=$(api "https://api.github.com/repos/${REPO}/actions/workflows/e2e-target.yml/runs?per_page=1" | jq -r '.workflow_runs[0].id // 0')
+          echo "baseline e2e-target run id: $before"
+
+          # Start the orchestrator.
+          ./multirunner run --config e2e.yaml > mr.log 2>&1 &
+          MRPID=$!
+          cleanup() { kill $MRPID 2>/dev/null || true; echo "=== multirunner log ==="; cat mr.log; }
+          trap cleanup EXIT
+
+          # Wait for an ephemeral runner to come online.
+          echo "waiting for a self-hosted runner to register..."
+          for i in $(seq 1 40); do
+            online=$(api "https://api.github.com/repos/${REPO}/actions/runners" \
+              | jq -r '[.runners[] | select(.status=="online")] | length')
+            [ "${online:-0}" -ge 1 ] && { echo "runner online"; break; }
+            sleep 5
+          done
+          if [ "${online:-0}" -lt 1 ]; then echo "::error::no runner came online"; exit 1; fi
+
+          # Dispatch the workload.
+          api -X POST "https://api.github.com/repos/${REPO}/actions/workflows/e2e-target.yml/dispatches" \
+            -d '{"ref":"main"}'
+          echo "dispatched e2e-target"
+
+          # Find the new run.
+          runid=0
+          for i in $(seq 1 24); do
+            runid=$(api "https://api.github.com/repos/${REPO}/actions/workflows/e2e-target.yml/runs?per_page=1" | jq -r '.workflow_runs[0].id // 0')
+            [ "$runid" != "$before" ] && [ "$runid" != "0" ] && break
+            sleep 5
+          done
+          if [ "$runid" = "$before" ] || [ "$runid" = "0" ]; then echo "::error::dispatched run not found"; exit 1; fi
+          echo "e2e-target run id: $runid"
+
+          # Wait for it to finish.
+          for i in $(seq 1 60); do
+            read -r status conclusion < <(api "https://api.github.com/repos/${REPO}/actions/runs/${runid}" | jq -r '.status + " " + (.conclusion // "null")')
+            echo "run status=$status conclusion=$conclusion"
+            [ "$status" = "completed" ] && break
+            sleep 5
+          done
+
+          if [ "$conclusion" != "success" ]; then
+            echo "::error::e2e-target concluded: $conclusion"
+            exit 1
+          fi
+          echo "E2E PASSED: runner provisioned + job succeeded"
