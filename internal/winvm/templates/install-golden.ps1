@@ -106,6 +106,62 @@ try {
         -Principal $principal -Force | Out-Null
     Mark 'task registered'
 
+    # Optional toolchains baked into the golden (multirunner bake --tools ...).
+    # __TOOLS__ is a comma list substituted by the host (empty => none). Big
+    # single-file payloads are staged on the CD by the host; FetchOrStage uses
+    # them, falling back to a slow in-guest download.
+    function Add-MachinePath($p) {
+        $mp = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+        if ($mp -notlike "*$p*") { [Environment]::SetEnvironmentVariable('Path', "$p;$mp", 'Machine') }
+    }
+    $tools = '__TOOLS__'.Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+    foreach ($t in $tools) {
+        switch ($t) {
+            'node' {
+                FetchOrStage 'node.zip' '__NODE_URL__' C:\node.zip
+                Expand-Archive C:\node.zip C:\ -Force
+                Remove-Item C:\node.zip
+                $nd = (Get-ChildItem C:\ -Directory -Filter 'node-v*-win-x64' | Select-Object -First 1).FullName
+                Rename-Item $nd C:\nodejs
+                Add-MachinePath 'C:\nodejs'
+                & C:\nodejs\corepack.cmd enable 2>$null
+                Mark 'node installed'
+            }
+            'go' {
+                FetchOrStage 'go.zip' '__GO_URL__' C:\go.zip
+                Expand-Archive C:\go.zip C:\ -Force   # extracts C:\go
+                Remove-Item C:\go.zip
+                Add-MachinePath 'C:\go\bin'
+                Mark 'go installed'
+            }
+            'dotnet' {
+                FetchOrStage 'dotnet-install.ps1' 'https://dot.net/v1/dotnet-install.ps1' C:\dotnet-install.ps1
+                & C:\dotnet-install.ps1 -Channel 8.0 -InstallDir C:\dotnet
+                & C:\dotnet-install.ps1 -Channel 9.0 -InstallDir C:\dotnet
+                Remove-Item C:\dotnet-install.ps1
+                [Environment]::SetEnvironmentVariable('DOTNET_ROOT', 'C:\dotnet', 'Machine')
+                [Environment]::SetEnvironmentVariable('DOTNET_CLI_TELEMETRY_OPTOUT', '1', 'Machine')
+                Add-MachinePath 'C:\dotnet'
+                Mark 'dotnet installed'
+            }
+            'buildtools' {
+                FetchOrStage 'vs_buildtools.exe' 'https://aka.ms/vs/17/release/vs_buildtools.exe' C:\vs_buildtools.exe
+                $p = Start-Process -FilePath C:\vs_buildtools.exe -Wait -PassThru -ArgumentList `
+                    '--quiet', '--wait', '--norestart', '--nocache', '--installPath', 'C:\BuildTools', `
+                    '--add', 'Microsoft.VisualStudio.Workload.VCTools', `
+                    '--add', 'Microsoft.VisualStudio.Component.VC.Tools.x86.x64', `
+                    '--add', 'Microsoft.VisualStudio.Component.Windows11SDK.26100', `
+                    '--add', 'Microsoft.VisualStudio.Component.VC.CMake.Project', `
+                    '--includeRecommended'
+                if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) { throw "vs_buildtools failed: $($p.ExitCode)" }
+                Remove-Item C:\vs_buildtools.exe
+                [Environment]::SetEnvironmentVariable('VSBUILDTOOLS', 'C:\BuildTools', 'Machine')
+                Mark 'buildtools installed'
+            }
+            default { Mark "unknown tool $t" }
+        }
+    }
+
     Mark 'GOLDEN_OK'
 
     # SetupComplete.cmd runs while Setup is still finishing (the image only

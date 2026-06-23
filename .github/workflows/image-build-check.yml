@@ -1,0 +1,60 @@
+name: image-build-check
+
+# Validates that the runner image flavors build (and the toolchains work) on PRs
+# touching the image files — without pushing. Uses plain `docker build` so the
+# layered chain resolves locally even before flavor tags are published.
+
+on:
+  pull_request:
+    paths:
+      - "images/**"
+      - ".github/workflows/image-build-check.yml"
+  workflow_dispatch:
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build flavor chain (no push, host arch)
+        run: |
+          set -euo pipefail
+          B=mr-check-linux
+          docker build -f images/linux/Dockerfile -t $B:minimal .
+          docker build -f images/linux/flavors/native-build.Dockerfile --build-arg PARENT=$B:minimal -t $B:native-build .
+          docker build -f images/linux/flavors/node.Dockerfile         --build-arg PARENT=$B:native-build -t $B:node .
+          docker build -f images/linux/flavors/dotnet.Dockerfile       --build-arg PARENT=$B:node          -t $B:dotnet .
+          docker build -f images/linux/flavors/rust.Dockerfile         --build-arg PARENT=$B:node          -t $B:rust .
+          docker build -f images/linux/flavors/go.Dockerfile           --build-arg PARENT=$B:native-build  -t $B:go .
+
+      - name: Smoke-test toolchains
+        run: |
+          set -euo pipefail
+          B=mr-check-linux
+          docker run --rm --entrypoint bash $B:native-build -lc 'gcc --version && cmake --version && python3 --version'
+          docker run --rm --entrypoint bash $B:node          -lc 'node --version && corepack --version'
+          docker run --rm --entrypoint bash $B:dotnet        -lc 'dotnet --list-sdks && node --version'
+          docker run --rm --entrypoint bash $B:rust          -lc 'rustc --version && cargo --version'
+          docker run --rm --entrypoint bash $B:go            -lc 'go version'
+
+  windows:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build minimal + buildtools (no push)
+        shell: bash
+        run: |
+          set -euo pipefail
+          B=mr-check-windows
+          docker build -f images/windows/Dockerfile -t $B:minimal .
+          docker build -f images/windows/flavors/buildtools.Dockerfile --build-arg "PARENT=$B:minimal" -t $B:buildtools .
+
+      - name: Smoke-test VS Build Tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          B=mr-check-windows
+          docker run --rm --entrypoint powershell $B:buildtools -NoProfile -Command \
+            "& 'C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe' -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath"

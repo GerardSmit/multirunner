@@ -158,7 +158,7 @@ on Windows Server, Hyper-V isolation on client. Windows only.`,
 		},
 	}
 
-	root.AddCommand(run, doctorC, connectC, winDaemon, installContainerd, bakeCmd(), screenshotCmd(), bootKeysCmd(), vmViewCmd(), jitISOCmd(), serviceCmd(&cfgPath))
+	root.AddCommand(run, doctorC, connectC, winDaemon, installContainerd, bakeCmd(), detectCmd(&cfgPath), screenshotCmd(), bootKeysCmd(), vmViewCmd(), jitISOCmd(), serviceCmd(&cfgPath))
 	return root
 }
 
@@ -238,6 +238,7 @@ func bakeCmd() *cobra.Command {
 	var iso, golden, accel, runnerVer, vncWeb string
 	var diskGB, memMB, cpus int
 	var licensed, prepareOnly bool
+	var tools []string
 	c := &cobra.Command{
 		Use:   "bake",
 		Short: "Build a golden Windows Server Core image for the QEMU (vm) backend",
@@ -254,7 +255,7 @@ command without running it (for manual/observed installs).`,
 			opts := winvm.BakeOptions{
 				WindowsISO: iso, Golden: golden, DiskGB: diskGB, MemMB: memMB,
 				CPUs: cpus, Accel: accel, RunnerVersion: runnerVer, Licensed: licensed,
-				VNCWeb: vncWeb,
+				VNCWeb: vncWeb, Tools: tools, WorkflowsHash: winvm.ToolsHash(tools),
 			}
 			if prepareOnly {
 				autoISO, args, err := winvm.Prepare(cmd.Context(), &opts)
@@ -276,6 +277,7 @@ command without running it (for manual/observed installs).`,
 	c.Flags().IntVar(&cpus, "cpus", 2, "install VM vCPUs")
 	c.Flags().StringVar(&accel, "accel", "", "QEMU accel: kvm|whpx|hvf|tcg ('' = auto)")
 	c.Flags().StringVar(&runnerVer, "runner-version", "2.335.0", "actions/runner version to bake in")
+	c.Flags().StringSliceVar(&tools, "tools", nil, "toolchains to bake into the golden: dotnet,node,go,buildtools")
 	c.Flags().BoolVar(&licensed, "licensed", false, "a real Windows key/KMS is configured (skip eval housekeeping)")
 	c.Flags().StringVar(&vncWeb, "vnc-web", "127.0.0.1:8090", "serve a browser VNC viewer at host:port to watch the install (empty to disable)")
 	return c
@@ -400,6 +402,9 @@ func runOrchestrator(ctx context.Context, configPath string, interactive, instal
 		return err
 	}
 	logger := newLogger(cfg.Log)
+	for _, warn := range cfg.Warnings() {
+		logger.Warn(warn)
+	}
 
 	ghClient, err := github.New(ctx, cfg.GitHub, cfg.Auth)
 	if err != nil {
@@ -408,6 +413,8 @@ func runOrchestrator(ctx context.Context, configPath string, interactive, instal
 	logger.Info("starting",
 		"scope", cfg.GitHub.Scope, "owner", cfg.GitHub.Owner,
 		"provisioning", cfg.Provisioning, "pools", len(cfg.Pools))
+
+	runQEMUHousekeeping(ctx, cfg, logger)
 
 	gitMgr, err := setupGitCache(ctx, cfg, logger)
 	if err != nil {
@@ -420,8 +427,10 @@ func runOrchestrator(ctx context.Context, configPath string, interactive, instal
 		if err != nil {
 			return err
 		}
-		for k, v := range cache.RunnerEnv(advertise) {
-			sharedEnv[k] = v
+		if advertise != "" {
+			for k, v := range cache.RunnerEnv(advertise) {
+				sharedEnv[k] = v
+			}
 		}
 	}
 
@@ -479,6 +488,30 @@ func runOrchestrator(ctx context.Context, configPath string, interactive, instal
 	}
 	logger.Info("shutdown complete")
 	return nil
+}
+
+func runQEMUHousekeeping(ctx context.Context, cfg *config.Config, logger *slog.Logger) {
+	var refs []winvm.GoldenRef
+	for _, pc := range cfg.Pools {
+		if pc.Backend != "qemu" {
+			continue
+		}
+		refs = append(refs, winvm.GoldenRef{Bake: winvm.BakeOptions{
+			WindowsISO:    pc.QEMU.BakeISO,
+			Golden:        pc.QEMU.Golden,
+			MemMB:         pc.QEMU.MemMB,
+			CPUs:          pc.QEMU.CPUs,
+			Accel:         pc.QEMU.Accel,
+			RunnerVersion: pc.QEMU.RunnerVersion,
+			Licensed:      pc.QEMU.Licensed,
+			Tools:         pc.QEMU.Tools,
+			WorkflowsHash: winvm.ToolsHash(pc.QEMU.Tools),
+		}})
+	}
+	if len(refs) == 0 {
+		return
+	}
+	winvm.NewHousekeeper(refs, winvm.DefaultPolicy(), 0, logger).CheckOnce(ctx)
 }
 
 // runAutoscale runs the on-demand scaler (polling) plus an optional webhook

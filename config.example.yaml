@@ -45,7 +45,11 @@ cache:
   # URL of this cache as seen from INSIDE runner containers (host.docker.internal
   # for Docker, host.containers.internal for Podman). Injected as ACTIONS_RESULTS_URL.
   advertise_url: "http://host.docker.internal:3000"
-  skip_token_validation: true    # we own the runners; accept any bearer
+  # Optional private path token. Embedded cache generates one automatically and
+  # injects it into runners; set this only when coordinating with an external
+  # standalone cacheserver's --access-token.
+  access_token: "${MULTIRUNNER_CACHE_ACCESS_TOKEN}"
+  skip_token_validation: true    # path token gates access; accept opaque/missing Actions bearer
   upstream: "https://results-receiver.actions.githubusercontent.com"
   # Housekeeping: evict cache entries unused for max_age_days, and LRU-evict to
   # keep total blob size under max_size_gb (0 => unlimited). gc_interval_sec sets
@@ -59,6 +63,11 @@ pools:
     os: linux
     size: 3
     runner_group_id: 1
+    # image_tier picks a prebuilt flavor (pulled automatically):
+    #   minimal (default) | native-build | node | dotnet | rust | go
+    # or set image: to use your own. dotnet/rust already bundle Node.
+    # Tip: `multirunner detect --path .` recommends flavors for a repo.
+    image_tier: minimal
     labels: [self-hosted, linux, x64]
     work_folder: _work
     name_prefix: multirunner
@@ -72,6 +81,16 @@ pools:
       volume: "mr-toolcache-linux"
       readonly: true
     max_consecutive_failures: 5
+
+  # Flavor pool example: a .NET + Node image, selected from a workflow with
+  #   runs-on: [self-hosted, linux, dotnet]
+  - name: linux-dotnet
+    os: linux
+    size: 2
+    image_tier: dotnet
+    labels: [self-hosted, linux, dotnet]
+    docker:
+      host: "tcp://127.0.0.1:2375"
 
   # Windows runners on a LINUX host via a QEMU VM (golden Server Core image +
   # per-job copy-on-write overlay). Build the golden image first: multirunner bake.
@@ -87,6 +106,10 @@ pools:
       mem_mb: 4096
       cpus: 2
       accel: ""                  # "" = auto: kvm (Linux) / whpx (Windows) / hvf (macOS)
+      # Toolchains baked into the golden (the VM equivalent of image_tier; qemu
+      # ignores image/image_tier). Options: dotnet | node | go | buildtools.
+      # Match `multirunner bake --tools ...`; changing the set forces a rebuild.
+      # tools: [dotnet, node, buildtools]
 
   - name: windows-pool
     os: windows

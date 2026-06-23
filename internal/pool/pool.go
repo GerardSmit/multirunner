@@ -4,6 +4,7 @@ package pool
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"sync"
 
@@ -97,16 +98,45 @@ func NewManager(pools []*Pool, logger *slog.Logger) *Manager {
 
 // Run starts all pools and blocks until ctx is cancelled.
 func (m *Manager) Run(ctx context.Context) error {
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	var wg sync.WaitGroup
+	errCh := make(chan error, len(m.pools))
 	for _, p := range m.pools {
 		wg.Add(1)
 		go func(pl *Pool) {
 			defer wg.Done()
-			if err := pl.Run(ctx); err != nil {
+			if err := pl.Run(runCtx); err != nil && runCtx.Err() == nil {
 				m.logger.Error("pool stopped", "pool", pl.l.Name(), "err", err)
+				select {
+				case errCh <- fmt.Errorf("pool %s: %w", pl.l.Name(), err):
+					cancel()
+				default:
+				}
 			}
 		}(p)
 	}
-	wg.Wait()
-	return nil
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case err := <-errCh:
+		<-done
+		return err
+	case <-ctx.Done():
+		cancel()
+		<-done
+		return nil
+	case <-done:
+		select {
+		case err := <-errCh:
+			return err
+		default:
+		}
+		return nil
+	}
 }

@@ -110,6 +110,7 @@ type Cache struct {
 	Listen              string `yaml:"listen"`
 	AdvertiseURL        string `yaml:"advertise_url"` // URL of this cache as seen from inside runner containers
 	ExternalURL         string `yaml:"external_url"`  // if set, use an already-running cache here instead of starting the embedded server
+	AccessToken         string `yaml:"access_token"`  // optional shared path token for cache API URLs; generated when omitted
 	SkipTokenValidation bool   `yaml:"skip_token_validation"`
 	Upstream            string `yaml:"upstream"`
 	// Housekeeping (garbage collection of stored entries):
@@ -137,8 +138,27 @@ type Pool struct {
 	MaxConsecutiveFailures int        `yaml:"max_consecutive_failures"`
 }
 
-// ImageRef resolves the container image for a pool: an explicit image wins;
-// otherwise a per-OS, per-tier local tag (the build pipeline produces these).
+// publishedFlavors lists the per-OS image flavors CI builds and pushes as tags
+// on gerardsmit/multirunner-runner-<os>. A pool's image_tier naming one of these
+// resolves to the published tag; unknown tiers fall back to a local :dev build.
+var publishedFlavors = map[string]map[string]bool{
+	"linux": {
+		"native-build": true,
+		"node":         true,
+		"dotnet":       true,
+		"rust":         true,
+		"go":           true,
+	},
+	"windows": {
+		"buildtools": true,
+	},
+}
+
+// ImageRef resolves the container image for a pool, in priority order:
+//   - an explicit image: wins outright;
+//   - tier "" / "minimal" -> the published :latest base image;
+//   - a known published flavor -> the published :<flavor> tag;
+//   - any other tier -> a local multirunner/runner-<os>-<tier>:dev build.
 func (p Pool) ImageRef() string {
 	if p.Image != "" {
 		return p.Image
@@ -148,6 +168,9 @@ func (p Pool) ImageRef() string {
 		// Published image (built + pushed by CI), auto-pulled on first run — no
 		// local build needed for the common case.
 		return "gerardsmit/multirunner-runner-" + p.OS + ":latest"
+	}
+	if publishedFlavors[p.OS][tier] {
+		return "gerardsmit/multirunner-runner-" + p.OS + ":" + tier
 	}
 	return "multirunner/runner-" + p.OS + "-" + tier + ":dev"
 }
@@ -173,9 +196,10 @@ type QEMU struct {
 	CPUs    int    `yaml:"cpus"`
 	Accel   string `yaml:"accel"` // "" = auto (kvm/whpx/hvf)
 	// Housekeeping (golden eval license + rebuilds):
-	BakeISO       string `yaml:"bake_iso"`       // Windows ISO for rebuilds (enables auto-rebuild)
-	RunnerVersion string `yaml:"runner_version"` // runner version to bake
-	Licensed      bool   `yaml:"licensed"`       // real key/KMS -> skip eval housekeeping
+	BakeISO       string   `yaml:"bake_iso"`       // Windows ISO for rebuilds (enables auto-rebuild)
+	RunnerVersion string   `yaml:"runner_version"` // runner version to bake
+	Licensed      bool     `yaml:"licensed"`       // real key/KMS -> skip eval housekeeping
+	Tools         []string `yaml:"tools"`          // toolchains to bake into the golden: dotnet | node | go | buildtools
 }
 
 // Containerd configures the containerd/runhcs Windows-container backend. The
@@ -238,6 +262,7 @@ func (c *Config) resolveSecrets() {
 	c.Auth.PAT = expandEnvRef(c.Auth.PAT)
 	c.Auth.PrivateKeyPath = expandEnvRef(c.Auth.PrivateKeyPath)
 	c.Webhook.Secret = expandEnvRef(c.Webhook.Secret)
+	c.Cache.AccessToken = expandEnvRef(c.Cache.AccessToken)
 }
 
 // expandEnvRef resolves a value of the form "${NAME}" or "$NAME" to the named
@@ -324,6 +349,23 @@ func (c *Config) applyDefaults() {
 			p.Docker.Isolation = "process"
 		}
 	}
+}
+
+// Warnings returns non-fatal configuration smells worth surfacing at startup.
+// Unlike Validate (which rejects broken configs), these are settings that are
+// silently ineffective — e.g. an image flavor on a QEMU pool, which boots a
+// baked golden image and ignores image/image_tier entirely.
+func (c *Config) Warnings() []string {
+	var w []string
+	for i := range c.Pools {
+		p := &c.Pools[i]
+		if p.Backend == "qemu" && (p.Image != "" || (p.ImageTier != "" && p.ImageTier != "minimal")) {
+			w = append(w, fmt.Sprintf(
+				"pool %q: backend=qemu ignores image/image_tier (it boots the baked golden image); "+
+					"bake toolchains into the golden instead (multirunner bake --tools ...)", p.Name))
+		}
+	}
+	return w
 }
 
 // Validate checks required fields and cross-field consistency.

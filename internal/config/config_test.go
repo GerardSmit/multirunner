@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -113,7 +114,13 @@ func TestImageRef(t *testing.T) {
 	}{
 		{"linux", "minimal", "", "gerardsmit/multirunner-runner-linux:latest"},
 		{"linux", "", "", "gerardsmit/multirunner-runner-linux:latest"},
-		{"linux", "github-like", "", "multirunner/runner-linux-github-like:dev"},
+		{"linux", "dotnet", "", "gerardsmit/multirunner-runner-linux:dotnet"},
+		{"linux", "node", "", "gerardsmit/multirunner-runner-linux:node"},
+		{"linux", "native-build", "", "gerardsmit/multirunner-runner-linux:native-build"},
+		{"linux", "rust", "", "gerardsmit/multirunner-runner-linux:rust"},
+		{"linux", "go", "", "gerardsmit/multirunner-runner-linux:go"},
+		{"windows", "buildtools", "", "gerardsmit/multirunner-runner-windows:buildtools"},
+		{"linux", "custom", "", "multirunner/runner-linux-custom:dev"},
 		{"windows", "minimal", "", "gerardsmit/multirunner-runner-windows:latest"},
 		{"linux", "minimal", "ghcr.io/me/x:1", "ghcr.io/me/x:1"},
 	}
@@ -122,6 +129,21 @@ func TestImageRef(t *testing.T) {
 		if got := p.ImageRef(); got != c.want {
 			t.Errorf("ImageRef(os=%s tier=%s explicit=%s) = %q, want %q", c.os, c.tier, c.explicit, got, c.want)
 		}
+	}
+}
+
+func TestWarningsQEMUImageTier(t *testing.T) {
+	c := &Config{Pools: []Pool{
+		{Name: "vm", Backend: "qemu", ImageTier: "dotnet"},
+		{Name: "vm-ok", Backend: "qemu", ImageTier: "minimal"},
+		{Name: "docker", ImageTier: "dotnet"},
+	}}
+	w := c.Warnings()
+	if len(w) != 1 {
+		t.Fatalf("warnings = %v, want 1 (only the qemu+image_tier pool)", w)
+	}
+	if !strings.Contains(w[0], "vm") || !strings.Contains(w[0], "qemu") {
+		t.Errorf("unexpected warning: %q", w[0])
 	}
 }
 

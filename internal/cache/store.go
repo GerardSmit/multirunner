@@ -324,6 +324,10 @@ func (s *store) completeUpload(ctx context.Context, key, version, scope, repoID 
 		_, _ = s.db.ExecContext(ctx, `DELETE FROM uploads WHERE id=?`, up.id)
 		return "", fmt.Errorf("%w: expected %d found %d", errPartMismatch, up.fin, actual)
 	}
+	if err := s.requireContiguousParts(folder, up.fin); err != nil {
+		_, _ = s.db.ExecContext(ctx, `DELETE FROM uploads WHERE id=?`, up.id)
+		return "", err
+	}
 
 	// Replace any existing entry's blob folder before repointing.
 	var oldFolder string
@@ -464,6 +468,18 @@ func (s *store) countParts(folder string) (int, error) {
 		}
 	}
 	return n, nil
+}
+
+func (s *store) requireContiguousParts(folder string, count int) error {
+	for i := 0; i < count; i++ {
+		if _, err := os.Stat(s.partPath(folder, i)); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("%w: missing part %d", errPartMismatch, i)
+			}
+			return err
+		}
+	}
+	return nil
 }
 
 // partsReader streams parts 0..partCount-1 of a folder as one continuous stream.

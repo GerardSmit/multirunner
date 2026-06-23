@@ -2,7 +2,9 @@ package winvm
 
 import (
 	"context"
+	"crypto/sha256"
 	"embed"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"log/slog"
@@ -10,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -21,6 +24,49 @@ import (
 // actions/checkout uses real git (incremental fetch + dotgit-cache bundle) and
 // `run:`/job-hook steps can run git. Kept in sync with install-golden.ps1.
 const minGitURL = "https://github.com/git-for-windows/git/releases/download/v2.54.0.windows.1/MinGit-2.54.0-64-bit.zip"
+
+// Toolchain versions baked into the golden when requested via --tools. Kept here
+// (not in the script) so the host can stage the big downloads onto the CD.
+const (
+	bakeNodeVersion = "22.20.0"
+	bakeGoVersion   = "1.24.4"
+)
+
+func bakeNodeURL() string {
+	return fmt.Sprintf("https://nodejs.org/dist/v%s/node-v%s-win-x64.zip", bakeNodeVersion, bakeNodeVersion)
+}
+func bakeGoURL() string {
+	return fmt.Sprintf("https://go.dev/dl/go%s.windows-amd64.zip", bakeGoVersion)
+}
+
+// ToolsHash is a stable fingerprint of the requested toolchains, stored in the
+// golden meta as the WorkflowsHash so housekeeping rebuilds the golden when the
+// tool set changes.
+func ToolsHash(tools []string) string {
+	norm := normalizeTools(tools)
+	if len(norm) == 0 {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(strings.Join(norm, ",")))
+	return "tools:" + hex.EncodeToString(sum[:8])
+}
+
+// normalizeTools lowercases, de-dups, and sorts a tool list for stable hashing
+// and substitution.
+func normalizeTools(tools []string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, t := range tools {
+		t = strings.ToLower(strings.TrimSpace(t))
+		if t == "" || seen[t] {
+			continue
+		}
+		seen[t] = true
+		out = append(out, t)
+	}
+	sort.Strings(out)
+	return out
+}
 
 //go:embed templates/autounattend.xml templates/install-golden.ps1 templates/startup.ps1 templates/setupcomplete.cmd templates/githook.ps1
 var templatesFS embed.FS
@@ -34,6 +80,7 @@ type BakeOptions struct {
 	CPUs             int
 	Accel            string // "" = auto
 	RunnerVersion    string
+	Tools            []string // toolchains baked into the golden: dotnet | node | go | buildtools
 	AdminPassword    string
 	EvalDays         int  // 180 (server) / 90 (client)
 	MaxRearms        int  // ~5
@@ -71,6 +118,18 @@ func (o *BakeOptions) defaults() {
 	}
 	if o.Timeout <= 0 {
 		o.Timeout = 45 * time.Minute
+		// Toolchains add large in-guest downloads/installs over the slow SLIRP
+		// network; VS Build Tools especially. Give the install more headroom.
+		for _, t := range normalizeTools(o.Tools) {
+			switch t {
+			case "buildtools":
+				o.Timeout = 120 * time.Minute
+			case "dotnet", "node", "go":
+				if o.Timeout < 75*time.Minute {
+					o.Timeout = 75 * time.Minute
+				}
+			}
+		}
 	}
 	if o.Accel == "" {
 		o.Accel = "" // resolved by caller/runtime; bake uses tcg fallback if empty
@@ -108,7 +167,7 @@ func copyFile(dst, src string) error {
 
 // AutounattendFiles returns the answer file + provisioning scripts with bake
 // substitutions applied (for the autounattend ISO).
-func AutounattendFiles(runnerVersion, adminPassword string) (map[string]string, error) {
+func AutounattendFiles(runnerVersion, adminPassword string, tools []string) (map[string]string, error) {
 	read := func(name string) (string, error) {
 		b, err := templatesFS.ReadFile("templates/" + name)
 		return string(b), err
@@ -135,6 +194,9 @@ func AutounattendFiles(runnerVersion, adminPassword string) (map[string]string, 
 	}
 	unattend = strings.ReplaceAll(unattend, "__ADMIN_PASSWORD__", adminPassword)
 	install = strings.ReplaceAll(install, "__RUNNER_VERSION__", runnerVersion)
+	install = strings.ReplaceAll(install, "__TOOLS__", strings.Join(normalizeTools(tools), ","))
+	install = strings.ReplaceAll(install, "__NODE_URL__", bakeNodeURL())
+	install = strings.ReplaceAll(install, "__GO_URL__", bakeGoURL())
 	return map[string]string{
 		"autounattend.xml":   unattend,
 		"setupcomplete.cmd":  setupComplete,
@@ -232,7 +294,7 @@ func cpuArg(accel string) string {
 // temp dir and returns ISO file refs (name -> host path) plus a cleanup func.
 // Best-effort: a file that fails to download is simply omitted, and the guest
 // falls back to downloading it itself.
-func stageBakeBinaries(ctx context.Context, runnerVersion string) (map[string]string, func()) {
+func stageBakeBinaries(ctx context.Context, runnerVersion string, tools []string) (map[string]string, func()) {
 	dir, err := os.MkdirTemp("", "mr-bakestage")
 	if err != nil {
 		return nil, func() {}
@@ -240,7 +302,21 @@ func stageBakeBinaries(ctx context.Context, runnerVersion string) (map[string]st
 	cleanup := func() { _ = os.RemoveAll(dir) }
 	refs := map[string]string{}
 	runnerURL := fmt.Sprintf("https://github.com/actions/runner/releases/download/v%s/actions-runner-win-x64-%s.zip", runnerVersion, runnerVersion)
-	for name, url := range map[string]string{"runner.zip": runnerURL, "mingit.zip": minGitURL} {
+	stage := map[string]string{"runner.zip": runnerURL, "mingit.zip": minGitURL}
+	// Stage the big single-file toolchain payloads on the CD too (SLIRP is slow).
+	// vs_buildtools is not staged: its bootstrapper pulls payloads from MS at run
+	// time regardless, so install-golden downloads it directly.
+	for _, t := range normalizeTools(tools) {
+		switch t {
+		case "node":
+			stage["node.zip"] = bakeNodeURL()
+		case "go":
+			stage["go.zip"] = bakeGoURL()
+		case "dotnet":
+			stage["dotnet-install.ps1"] = "https://dot.net/v1/dotnet-install.ps1"
+		}
+	}
+	for name, url := range stage {
 		dst := filepath.Join(dir, name)
 		if err := downloadFile(ctx, url, dst); err != nil {
 			continue
@@ -287,7 +363,7 @@ func Prepare(ctx context.Context, o *BakeOptions) (autoISO string, args []string
 		return "", nil, fmt.Errorf("create golden disk: %w: %s", err, out)
 	}
 	_ = os.Remove(GoldenSerialPath(o.Golden)) // stale markers must not satisfy the bake check
-	files, err := AutounattendFiles(o.RunnerVersion, o.AdminPassword)
+	files, err := AutounattendFiles(o.RunnerVersion, o.AdminPassword, o.Tools)
 	if err != nil {
 		return "", nil, err
 	}
@@ -296,7 +372,7 @@ func Prepare(ctx context.Context, o *BakeOptions) (autoISO string, args []string
 	// virtual CD. The VM's user-mode (SLIRP) network is too slow/flaky for ~230MB
 	// of downloads; the host fetches them fast and install-golden copies from CD,
 	// falling back to a direct download only if a staged file is missing.
-	refs, cleanup := stageBakeBinaries(ctx, o.RunnerVersion)
+	refs, cleanup := stageBakeBinaries(ctx, o.RunnerVersion, o.Tools)
 	defer cleanup()
 	if err := BuildISOFiles(autoISO, "AUTOUNATTEND", files, refs); err != nil {
 		return "", nil, err

@@ -192,12 +192,18 @@ func (m *Manager) cloneURL(repoSlug string) string {
 }
 
 // git runs a git command, optionally inside repoDir, injecting an auth header
-// when a token is configured (kept out of argv and process listings via -c).
+// through Git's environment-based config when a token is configured. Keeping it
+// out of argv avoids exposing the PAT in command-line process listings.
 func (m *Manager) git(ctx context.Context, repoDir string, args ...string) error {
 	full := make([]string, 0, len(args)+4)
+	env := os.Environ()
 	if m.token != "" {
 		hdr := "AUTHORIZATION: basic " + base64.StdEncoding.EncodeToString([]byte("x-access-token:"+m.token))
-		full = append(full, "-c", "http.extraHeader="+hdr)
+		env = append(env,
+			"GIT_CONFIG_COUNT=1",
+			"GIT_CONFIG_KEY_0=http.extraHeader",
+			"GIT_CONFIG_VALUE_0="+hdr,
+		)
 	}
 	if repoDir != "" {
 		full = append(full, "-C", repoDir)
@@ -205,7 +211,7 @@ func (m *Manager) git(ctx context.Context, repoDir string, args ...string) error
 	full = append(full, args...)
 
 	cmd := exec.CommandContext(ctx, "git", full...)
-	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+	cmd.Env = append(env, "GIT_TERMINAL_PROMPT=0")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("git %s: %w: %s", redact(args), err, strings.TrimSpace(string(out)))
