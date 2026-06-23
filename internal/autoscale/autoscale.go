@@ -105,22 +105,13 @@ func (s *Scaler) reconcile() {
 	if s.scope != config.ScopeRepo {
 		return // org/enterprise: rely on webhook (no cheap queued-jobs endpoint)
 	}
-	n, err := s.gh.CountQueuedRuns(s.baseCtx)
+	jobs, err := s.gh.QueuedJobLabels(s.baseCtx)
 	if err != nil {
-		s.logger.Warn("poll queued runs failed", "err", err)
+		s.logger.Warn("poll queued jobs failed", "err", err)
 		return
 	}
-	for i := 0; i < n; i++ {
-		launched := false
-		for _, st := range s.states {
-			if s.tryLaunch(st) {
-				launched = true
-				break
-			}
-		}
-		if !launched {
-			break // all pools at capacity
-		}
+	for _, labels := range jobs {
+		s.OnQueued(labels)
 	}
 }
 

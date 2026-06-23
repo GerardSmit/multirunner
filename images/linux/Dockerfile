@@ -34,7 +34,9 @@ RUN perl -0777 -i \
       -pe 's/A\x00C\x00T\x00I\x00O\x00N\x00S\x00_\x00R\x00E\x00S\x00U\x00L\x00T\x00S\x00_\x00U\x00R\x00L\x00/A\x00C\x00T\x00I\x00O\x00N\x00S\x00_\x00R\x00E\x00S\x00U\x00L\x00T\x00S\x00_\x00U\x00R\x00X\x00/g;' \
       -pe 's/A\x00C\x00T\x00I\x00O\x00N\x00S\x00_\x00C\x00A\x00C\x00H\x00E\x00_\x00U\x00R\x00L\x00/A\x00C\x00T\x00I\x00O\x00N\x00S\x00_\x00C\x00A\x00C\x00H\x00E\x00_\x00U\x00R\x00X\x00/g;' \
       bin/Runner.Worker.dll \
-    && grep -qa "A.C.T.I.O.N.S._.R.E.S.U.L.T.S._.U.R.X" bin/Runner.Worker.dll || (echo "patch failed" && exit 1)
+    && grep -qa "A.C.T.I.O.N.S._.R.E.S.U.L.T.S._.U.R.X" bin/Runner.Worker.dll \
+    && grep -qa "A.C.T.I.O.N.S._.C.A.C.H.E._.U.R.X" bin/Runner.Worker.dll \
+    || (echo "patch failed" && exit 1)
 
 FROM ${BASE}
 ENV DEBIAN_FRONTEND=noninteractive \

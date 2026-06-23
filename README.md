@@ -138,7 +138,60 @@ pools:
 ```
 
 The image defaults to the published `gerardsmit/multirunner-runner-linux:latest`
-and is pulled automatically. Set `image:` only to use your own.
+and is pulled automatically. Set `image:` only to use your own, or pick a
+prebuilt **flavor** with `image_tier:` (see below).
+
+### Runner image flavors
+
+The default `minimal` image is just the runner + git. For common toolchains, set
+`image_tier:` to a prebuilt flavor — published as tags on
+`gerardsmit/multirunner-runner-<os>` and pulled automatically:
+
+| `image_tier`   | OS      | Includes                                                        |
+|----------------|---------|----------------------------------------------------------------|
+| `minimal` (default) | both | runner + git + jq + unzip (Linux) / MinGit (Windows)      |
+| `native-build` | linux   | gcc/g++/make, cmake, ninja, pkg-config, python3 (+dev)         |
+| `node`         | linux   | + Node LTS + corepack (npm/pnpm/yarn); node-gyp works          |
+| `dotnet`       | linux   | + .NET SDK 8 & 9 (**Node included** for ASP.NET SPA builds)    |
+| `rust`         | linux   | + rustup stable + musl target (**Node included** for napi-rs)  |
+| `go`           | linux   | + Go toolchain                                                 |
+| `buildtools`   | windows | + VS 2022 Build Tools (MSVC v143, Windows SDK, CMake, MSBuild) |
+
+Flavors layer on one another (`dotnet` ⊃ `node` ⊃ `native-build`), so picking the
+narrowest one that fits keeps pulls small. Full Visual Studio (IDE) isn't
+container-viable — use a [QEMU golden VM](#windows-runners-on-a-linux-host-qemu-vm)
+for that. A custom `image_tier:` you build yourself resolves to a local
+`multirunner/runner-<os>-<tier>:dev` tag.
+
+**Routing is label-based:** give each flavor pool a distinct label and select it
+from a workflow with `runs-on`:
+
+```yaml
+pools:
+  - name: linux-dotnet
+    os: linux
+    image_tier: dotnet
+    labels: [self-hosted, linux, dotnet]
+  - name: linux-node
+    os: linux
+    image_tier: node
+    labels: [self-hosted, linux, node]
+```
+
+```yaml
+# in the consuming repo's workflow
+jobs:
+  build:
+    runs-on: [self-hosted, linux, dotnet]
+```
+
+Not sure which flavors a repo needs? **`multirunner detect`** scans it and prints a
+ready-to-paste `pools:` block plus the images to pull:
+
+```sh
+multirunner detect --path .                 # scan a local checkout
+multirunner detect --repo octo/hello        # scan a remote repo via the GitHub API
+```
 
 ### Windows containers (containerd, no Docker Desktop)
 
@@ -214,6 +267,7 @@ cache:
   enabled: true
   mode: local-server
   advertise_url: "http://host.docker.internal:3000"   # reachable from runners
+  access_token: "${MULTIRUNNER_CACHE_ACCESS_TOKEN}"   # optional; embedded server generates one
   max_age_days: 7        # evict entries unused this long
   max_size_gb: 0         # 0 = unlimited; otherwise LRU-evict to fit
 ```
@@ -224,6 +278,10 @@ plus the Azure block-upload data plane, stores blobs locally, and injects
 every runner. The runner image includes a small patch so the redirect reaches
 `uses:` actions (not just `run:` steps). Stale entries are garbage-collected
 automatically.
+
+The embedded cache adds a private `/_mr/<token>` path segment to the URL it
+injects into runners. For a standalone external cache server, start it with
+`--access-token ...` and put the matching token path in `cache.external_url`.
 
 > **Podman on Windows:** runners reach the host bridge as
 > `host.containers.internal` (the Podman VM, `10.88.0.1`), not the Windows host.
@@ -307,6 +365,7 @@ Built with cobra — `multirunner <command> --help` for details; `--config` is g
 multirunner [run]                   run the orchestrator (default)
 multirunner connect --org <org>     create + install a GitHub App, write auth to config
 multirunner doctor                  check daemons + container mode, no runners
+multirunner detect                  scan a repo, recommend image flavors + pools
 multirunner bake                    build a golden Windows VM image (qemu backend)
 multirunner install-containerd      install the Windows-container stack (elevates)
 multirunner service ...             install | uninstall | start | stop | restart

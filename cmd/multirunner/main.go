@@ -158,7 +158,7 @@ on Windows Server, Hyper-V isolation on client. Windows only.`,
 		},
 	}
 
-	root.AddCommand(run, doctorC, connectC, winDaemon, installContainerd, bakeCmd(), screenshotCmd(), bootKeysCmd(), vmViewCmd(), jitISOCmd(), serviceCmd(&cfgPath))
+	root.AddCommand(run, doctorC, connectC, winDaemon, installContainerd, bakeCmd(), detectCmd(&cfgPath), screenshotCmd(), bootKeysCmd(), vmViewCmd(), jitISOCmd(), serviceCmd(&cfgPath))
 	return root
 }
 
@@ -409,6 +409,8 @@ func runOrchestrator(ctx context.Context, configPath string, interactive, instal
 		"scope", cfg.GitHub.Scope, "owner", cfg.GitHub.Owner,
 		"provisioning", cfg.Provisioning, "pools", len(cfg.Pools))
 
+	runQEMUHousekeeping(ctx, cfg, logger)
+
 	gitMgr, err := setupGitCache(ctx, cfg, logger)
 	if err != nil {
 		return err
@@ -420,8 +422,10 @@ func runOrchestrator(ctx context.Context, configPath string, interactive, instal
 		if err != nil {
 			return err
 		}
-		for k, v := range cache.RunnerEnv(advertise) {
-			sharedEnv[k] = v
+		if advertise != "" {
+			for k, v := range cache.RunnerEnv(advertise) {
+				sharedEnv[k] = v
+			}
 		}
 	}
 
@@ -479,6 +483,28 @@ func runOrchestrator(ctx context.Context, configPath string, interactive, instal
 	}
 	logger.Info("shutdown complete")
 	return nil
+}
+
+func runQEMUHousekeeping(ctx context.Context, cfg *config.Config, logger *slog.Logger) {
+	var refs []winvm.GoldenRef
+	for _, pc := range cfg.Pools {
+		if pc.Backend != "qemu" {
+			continue
+		}
+		refs = append(refs, winvm.GoldenRef{Bake: winvm.BakeOptions{
+			WindowsISO:    pc.QEMU.BakeISO,
+			Golden:        pc.QEMU.Golden,
+			MemMB:         pc.QEMU.MemMB,
+			CPUs:          pc.QEMU.CPUs,
+			Accel:         pc.QEMU.Accel,
+			RunnerVersion: pc.QEMU.RunnerVersion,
+			Licensed:      pc.QEMU.Licensed,
+		}})
+	}
+	if len(refs) == 0 {
+		return
+	}
+	winvm.NewHousekeeper(refs, winvm.DefaultPolicy(), 0, logger).CheckOnce(ctx)
 }
 
 // runAutoscale runs the on-demand scaler (polling) plus an optional webhook

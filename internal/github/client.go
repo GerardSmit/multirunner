@@ -225,6 +225,46 @@ func (c *Client) queuedJobsForRun(ctx context.Context, runID int64) ([][]string,
 // Scope reports the configured scope.
 func (c *Client) Scope() config.Scope { return c.scope }
 
+// RepoFilePaths returns every blob path in the repo's default-branch tree. Used
+// by `multirunner detect --repo` to find language markers without a checkout.
+// Requires the client to be repo-scoped (owner + repo set).
+func (c *Client) RepoFilePaths(ctx context.Context) ([]string, error) {
+	if c.repo == "" {
+		return nil, fmt.Errorf("RepoFilePaths requires a repo-scoped client")
+	}
+	repo, _, err := c.gh.Repositories.Get(ctx, c.owner, c.repo)
+	if err != nil {
+		return nil, fmt.Errorf("get repo %s/%s: %w", c.owner, c.repo, err)
+	}
+	tree, _, err := c.gh.Git.GetTree(ctx, c.owner, c.repo, repo.GetDefaultBranch(), true)
+	if err != nil {
+		return nil, fmt.Errorf("get tree (%s): %w", repo.GetDefaultBranch(), err)
+	}
+	var out []string
+	for _, e := range tree.Entries {
+		if e.GetType() == "blob" {
+			out = append(out, e.GetPath())
+		}
+	}
+	return out, nil
+}
+
+// RepoFile returns the contents of a repo-relative path on the default branch.
+func (c *Client) RepoFile(ctx context.Context, p string) ([]byte, error) {
+	fc, _, _, err := c.gh.Repositories.GetContents(ctx, c.owner, c.repo, p, nil)
+	if err != nil {
+		return nil, fmt.Errorf("get contents %s: %w", p, err)
+	}
+	if fc == nil {
+		return nil, fmt.Errorf("%s is not a file", p)
+	}
+	s, err := fc.GetContent()
+	if err != nil {
+		return nil, fmt.Errorf("decode %s: %w", p, err)
+	}
+	return []byte(s), nil
+}
+
 // runnersPath builds the actions/runners sub-path for the configured scope.
 func (c *Client) runnersPath(action string) (string, error) {
 	switch c.scope {

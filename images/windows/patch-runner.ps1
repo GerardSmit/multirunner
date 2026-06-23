@@ -20,4 +20,5 @@ $r1 = Set-LastCharX $bytes 'ACTIONS_RESULTS_URL'
 $r2 = Set-LastCharX $bytes 'ACTIONS_CACHE_URL'
 [IO.File]::WriteAllBytes($Dll, $bytes)
 if (-not $r1) { Write-Error 'ACTIONS_RESULTS_URL literal not found; patch failed'; exit 1 }
+if (-not $r2) { Write-Error 'ACTIONS_CACHE_URL literal not found; patch failed'; exit 1 }
 Write-Host "patched RESULTS_URL=$r1 CACHE_URL=$r2"

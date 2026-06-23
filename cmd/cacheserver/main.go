@@ -20,6 +20,7 @@ func main() {
 	listen := flag.String("listen", "0.0.0.0:3000", "listen address")
 	path := flag.String("path", "/data", "storage path for cache db + blobs")
 	advertise := flag.String("advertise", "", "external URL of this cache (informational)")
+	accessToken := flag.String("access-token", "", "shared path token for cache API URLs (generated when empty)")
 	upstream := flag.String("upstream", "https://results-receiver.actions.githubusercontent.com", "catch-all proxy upstream")
 	skipToken := flag.Bool("skip-token-validation", true, "accept any bearer token")
 	flag.Parse()
@@ -36,6 +37,7 @@ func main() {
 		Path:                *path,
 		Listen:              *listen,
 		AdvertiseURL:        *advertise,
+		AccessToken:         *accessToken,
 		SkipTokenValidation: *skipToken,
 		Upstream:            *upstream,
 	}, logger)

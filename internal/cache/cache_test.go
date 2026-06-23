@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/GerardSmit/multirunner/internal/config"
@@ -39,13 +40,11 @@ func newTestServer(t *testing.T) (*Server, *httptest.Server) {
 	return s, ts
 }
 
+func cacheBase(s *Server) string { return s.AdvertiseURL() }
+
 func postJSON(t *testing.T, url string, body any) map[string]any {
 	t.Helper()
-	b, _ := json.Marshal(body)
-	resp, err := http.Post(url, "application/json", bytes.NewReader(b))
-	if err != nil {
-		t.Fatalf("POST %s: %v", url, err)
-	}
+	resp := postJSONRaw(t, url, body, "")
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		raw, _ := io.ReadAll(resp.Body)
@@ -58,6 +57,24 @@ func postJSON(t *testing.T, url string, body any) map[string]any {
 	return out
 }
 
+func postJSONRaw(t *testing.T, url string, body any, bearer string) *http.Response {
+	t.Helper()
+	b, _ := json.Marshal(body)
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(b))
+	if err != nil {
+		t.Fatalf("new POST %s: %v", url, err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if bearer != "" {
+		req.Header.Set("Authorization", "Bearer "+bearer)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST %s: %v", url, err)
+	}
+	return resp
+}
+
 // blockID48 builds a 48-byte standard block id encoding the given chunk index.
 func blockID48(index int) string {
 	raw := []byte(fmt.Sprintf("%-36s%012d", "uuid", index))
@@ -65,12 +82,12 @@ func blockID48(index int) string {
 }
 
 func TestCacheRoundTrip(t *testing.T) {
-	_, ts := newTestServer(t)
+	s, _ := newTestServer(t)
 	const svc = "/twirp/github.actions.results.api.v1.CacheService/"
 	key, version := "deps-abc", "v1"
 
 	// 1. CreateCacheEntry
-	create := postJSON(t, ts.URL+svc+"CreateCacheEntry", map[string]any{"key": key, "version": version})
+	create := postJSON(t, cacheBase(s)+svc+"CreateCacheEntry", map[string]any{"key": key, "version": version})
 	if create["ok"] != true {
 		t.Fatalf("CreateCacheEntry ok=%v", create["ok"])
 	}
@@ -87,13 +104,13 @@ func TestCacheRoundTrip(t *testing.T) {
 	putChunk(t, uploadURL+"?comp=blocklist", nil)
 
 	// 3. FinalizeCacheEntryUpload
-	fin := postJSON(t, ts.URL+svc+"FinalizeCacheEntryUpload", map[string]any{"key": key, "version": version})
+	fin := postJSON(t, cacheBase(s)+svc+"FinalizeCacheEntryUpload", map[string]any{"key": key, "version": version})
 	if fin["ok"] != true {
 		t.Fatalf("Finalize ok=%v", fin["ok"])
 	}
 
 	// 4. GetCacheEntryDownloadURL (exact key)
-	get := postJSON(t, ts.URL+svc+"GetCacheEntryDownloadURL",
+	get := postJSON(t, cacheBase(s)+svc+"GetCacheEntryDownloadURL",
 		map[string]any{"key": key, "version": version, "restore_keys": []string{}})
 	if get["ok"] != true {
 		t.Fatalf("Get ok=%v", get["ok"])
@@ -111,11 +128,11 @@ func TestCacheRoundTrip(t *testing.T) {
 }
 
 func TestCacheMissAndRestoreKeyPrefix(t *testing.T) {
-	_, ts := newTestServer(t)
+	s, _ := newTestServer(t)
 	const svc = "/twirp/github.actions.results.api.v1.CacheService/"
 
 	// Miss: nothing stored.
-	miss := postJSON(t, ts.URL+svc+"GetCacheEntryDownloadURL",
+	miss := postJSON(t, cacheBase(s)+svc+"GetCacheEntryDownloadURL",
 		map[string]any{"key": "nope", "version": "v1"})
 	if miss["ok"] != false {
 		t.Fatalf("expected miss, got %v", miss)
@@ -123,12 +140,12 @@ func TestCacheMissAndRestoreKeyPrefix(t *testing.T) {
 
 	// Store under key "deps-2024-01".
 	stored := "deps-2024-01"
-	create := postJSON(t, ts.URL+svc+"CreateCacheEntry", map[string]any{"key": stored, "version": "v1"})
+	create := postJSON(t, cacheBase(s)+svc+"CreateCacheEntry", map[string]any{"key": stored, "version": "v1"})
 	putChunk(t, create["signed_upload_url"].(string)+"?blockid="+blockID48(0), []byte("data"))
-	postJSON(t, ts.URL+svc+"FinalizeCacheEntryUpload", map[string]any{"key": stored, "version": "v1"})
+	postJSON(t, cacheBase(s)+svc+"FinalizeCacheEntryUpload", map[string]any{"key": stored, "version": "v1"})
 
 	// Restore-key prefix match: primary miss, restore_keys ["deps-"] should hit.
-	got := postJSON(t, ts.URL+svc+"GetCacheEntryDownloadURL",
+	got := postJSON(t, cacheBase(s)+svc+"GetCacheEntryDownloadURL",
 		map[string]any{"key": "deps-2024-02", "version": "v1", "restore_keys": []string{"deps-"}})
 	if got["ok"] != true {
 		t.Fatalf("expected restore-key hit, got %v", got)
@@ -138,10 +155,87 @@ func TestCacheMissAndRestoreKeyPrefix(t *testing.T) {
 	}
 
 	// Version mismatch must miss even with same key.
-	vm := postJSON(t, ts.URL+svc+"GetCacheEntryDownloadURL",
+	vm := postJSON(t, cacheBase(s)+svc+"GetCacheEntryDownloadURL",
 		map[string]any{"key": stored, "version": "v2"})
 	if vm["ok"] != false {
 		t.Errorf("expected version-mismatch miss, got %v", vm)
+	}
+}
+
+func TestCacheRejectsWrongAccessToken(t *testing.T) {
+	_, ts := newTestServer(t)
+	const svc = "/twirp/github.actions.results.api.v1.CacheService/"
+	resp := postJSONRaw(t, ts.URL+"/_mr/wrong"+svc+"CreateCacheEntry", map[string]any{"key": "k", "version": "v"}, "")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", resp.StatusCode)
+	}
+}
+
+func TestStrictTokenValidationRejectsMissingBearer(t *testing.T) {
+	s, ts := newTestServer(t)
+	s.skipValidation = false
+	const svc = "/twirp/github.actions.results.api.v1.CacheService/"
+	resp := postJSONRaw(t, cacheBase(s)+svc+"CreateCacheEntry", map[string]any{"key": "k", "version": "v"}, "")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", resp.StatusCode)
+	}
+	_ = ts
+}
+
+func TestSignedDataPlaneRejectsBareID(t *testing.T) {
+	s, _ := newTestServer(t)
+	url := strings.TrimRight(cacheBase(s), "/") + "/devstoreaccount1/upload/123?blockid=" + blockID48(0)
+	req, _ := http.NewRequest(http.MethodPut, url, strings.NewReader("x"))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403", resp.StatusCode)
+	}
+}
+
+func TestSparsePartsRejected(t *testing.T) {
+	s, _ := newTestServer(t)
+	const svc = "/twirp/github.actions.results.api.v1.CacheService/"
+	create := postJSON(t, cacheBase(s)+svc+"CreateCacheEntry", map[string]any{"key": "sparse", "version": "v1"})
+	putChunk(t, create["signed_upload_url"].(string)+"?blockid="+blockID48(0), []byte("a"))
+	putChunk(t, create["signed_upload_url"].(string)+"?blockid="+blockID48(2), []byte("c"))
+
+	resp := postJSONRaw(t, cacheBase(s)+svc+"FinalizeCacheEntryUpload", map[string]any{"key": "sparse", "version": "v1"}, "")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 400: %s", resp.StatusCode, raw)
+	}
+}
+
+func TestGitBundleLimitedToConfiguredRepo(t *testing.T) {
+	s, _ := newTestServer(t)
+	var got string
+	s.SetGitBundler("octo/hello", func(_ context.Context, repoSlug string, w io.Writer) error {
+		got = repoSlug
+		_, _ = io.WriteString(w, "bundle")
+		return nil
+	})
+	resp, err := http.Get(cacheBase(s) + "/gitmirror/octo/hello")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || got != "octo/hello" {
+		t.Fatalf("allowed status=%d got=%q", resp.StatusCode, got)
+	}
+	resp, err = http.Get(cacheBase(s) + "/gitmirror/octo/other")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("forbidden status=%d, want 404", resp.StatusCode)
 	}
 }
 

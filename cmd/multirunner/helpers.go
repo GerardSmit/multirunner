@@ -24,21 +24,23 @@ func startCache(ctx context.Context, cfg *config.Config, gitMgr *gitcache.Manage
 	if err != nil {
 		return "", fmt.Errorf("cache server: %w", err)
 	}
-	if cfg.GitCache.DotGit() && gitMgr != nil {
-		srv.SetGitBundler(gitMgr.Bundle)
-		logger.Info("dotgit-cache enabled: serving git bundles via the cache server")
+	if cfg.GitCache.DotGit() && gitMgr != nil && cfg.GitHub.Scope == config.ScopeRepo {
+		slug := cfg.GitHub.Owner + "/" + cfg.GitHub.Repo
+		srv.SetGitBundler(slug, gitMgr.Bundle)
+		logger.Info("dotgit-cache enabled: serving git bundles via the cache server", "repo", slug)
 	}
 	go func() {
 		if err := srv.Start(ctx); err != nil {
 			logger.Error("cache server stopped", "err", err)
 		}
 	}()
-	if cfg.Cache.AdvertiseURL == "" {
+	advertise := srv.AdvertiseURL()
+	if advertise == "" {
 		logger.Warn("cache enabled but advertise_url is empty; runners will not be redirected")
 	} else {
-		logger.Info("cache redirect enabled", "advertise", cfg.Cache.AdvertiseURL)
+		logger.Info("cache redirect enabled", "advertise", srv.RedactedAdvertiseURL())
 	}
-	return cfg.Cache.AdvertiseURL, nil
+	return advertise, nil
 }
 
 // setupGitCache builds the git mirror manager (if enabled) and, for repo scope,
@@ -129,9 +131,11 @@ func poolEnvAndMounts(cfg *config.Config, pc config.Pool, shared map[string]stri
 			// dotgit-cache: serve the mirror as a bundle over the cache server +
 			// a job-started hook seeds the workspace. Works where mounts can't
 			// (the QEMU VM). Needs the cache server (for the bundle endpoint).
-			env["MR_GIT_BUNDLE_URL"] = strings.TrimRight(cfg.Cache.AdvertiseURL, "/") + "/gitmirror/" + slug
-			if pc.OS == "windows" {
-				env["ACTIONS_RUNNER_HOOK_JOB_STARTED"] = `C:\mr-githook.ps1`
+			if base := strings.TrimRight(shared["ACTIONS_RESULTS_URL"], "/"); base != "" {
+				env["MR_GIT_BUNDLE_URL"] = base + "/gitmirror/" + slug
+				if pc.OS == "windows" {
+					env["ACTIONS_RUNNER_HOOK_JOB_STARTED"] = `C:\mr-githook.ps1`
+				}
 			}
 			logger.Debug("dotgit-cache enabled", "pool", pc.Name, "repo", slug)
 		default:

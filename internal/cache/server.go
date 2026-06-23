@@ -6,7 +6,11 @@ package cache
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -29,19 +33,22 @@ import (
 type Server struct {
 	store          *store
 	advertiseURL   string
+	accessToken    string
 	skipValidation bool
 	proxy          *httputil.ReverseProxy
 	httpSrv        *http.Server
 	logger         *slog.Logger
+	gitBundlerRepo string
 	gitBundler     func(ctx context.Context, repoSlug string, w io.Writer) error
 	gcInterval     time.Duration // 0 disables the GC sweep
 	gcMaxAge       time.Duration // 0 disables age-based eviction
 	gcMaxBytes     int64         // 0 disables size-based eviction
 }
 
-// SetGitBundler enables the dotgit-cache endpoint: GET /gitmirror/{owner}/{repo}
-// streams a git bundle of the repo's host mirror.
-func (s *Server) SetGitBundler(f func(ctx context.Context, repoSlug string, w io.Writer) error) {
+// SetGitBundler enables the dotgit-cache endpoint for one configured repository:
+// GET /gitmirror/{owner}/{repo} streams a git bundle of that repo's host mirror.
+func (s *Server) SetGitBundler(repoSlug string, f func(ctx context.Context, repoSlug string, w io.Writer) error) {
+	s.gitBundlerRepo = strings.TrimSuffix(repoSlug, ".git")
 	s.gitBundler = f
 }
 
@@ -57,9 +64,23 @@ func New(ctx context.Context, cfg config.Cache, logger *slog.Logger) (*Server, e
 		return nil, err
 	}
 
+	accessToken := cfg.AccessToken
+	if accessToken == "" {
+		var err error
+		accessToken, err = randomToken()
+		if err != nil {
+			st.Close()
+			return nil, fmt.Errorf("cache access token: %w", err)
+		}
+	} else if strings.ContainsAny(accessToken, "/?#") || url.PathEscape(accessToken) != accessToken {
+		st.Close()
+		return nil, fmt.Errorf("cache access token must be URL path safe")
+	}
+
 	s := &Server{
 		store:          st,
 		advertiseURL:   strings.TrimRight(cfg.AdvertiseURL, "/"),
+		accessToken:    accessToken,
 		skipValidation: cfg.SkipTokenValidation,
 		logger:         logger.With("component", "cache"),
 	}
@@ -87,24 +108,56 @@ func New(ctx context.Context, cfg config.Cache, logger *slog.Logger) (*Server, e
 }
 
 // AdvertiseURL is the base URL runners should use to reach this cache.
-func (s *Server) AdvertiseURL() string { return s.advertiseURL }
+func (s *Server) AdvertiseURL() string {
+	if s.advertiseURL == "" {
+		return ""
+	}
+	return s.advertiseURL + s.accessPrefix()
+}
+
+// RedactedAdvertiseURL is safe to log.
+func (s *Server) RedactedAdvertiseURL() string {
+	if s.advertiseURL == "" {
+		return ""
+	}
+	return s.advertiseURL + "/_mr/<redacted>"
+}
+
+func (s *Server) accessPrefix() string {
+	if s.accessToken == "" {
+		return ""
+	}
+	return "/_mr/" + s.accessToken
+}
 
 func (s *Server) routes() http.Handler {
 	mux := http.NewServeMux()
 	const svc = "/twirp/github.actions.results.api.v1.CacheService/"
-	mux.HandleFunc("POST "+svc+"CreateCacheEntry", s.handleCreateCacheEntry)
-	mux.HandleFunc("POST "+svc+"GetCacheEntryDownloadURL", s.handleGetDownloadURL)
-	mux.HandleFunc("POST "+svc+"FinalizeCacheEntryUpload", s.handleFinalize)
-	mux.HandleFunc("PUT /devstoreaccount1/upload/{id}", s.handleUploadPut)
-	mux.HandleFunc("PUT /upload/{id}", s.handleUploadPut)
-	mux.HandleFunc("GET /download/{id}", s.handleDownload)
-	mux.HandleFunc("GET /gitmirror/{owner}/{repo}", s.handleGitBundle)
+	protected := "/_mr/{token}"
+	mux.HandleFunc("POST "+protected+svc+"CreateCacheEntry", s.protect(s.handleCreateCacheEntry))
+	mux.HandleFunc("POST "+protected+svc+"GetCacheEntryDownloadURL", s.protect(s.handleGetDownloadURL))
+	mux.HandleFunc("POST "+protected+svc+"FinalizeCacheEntryUpload", s.protect(s.handleFinalize))
+	mux.HandleFunc("PUT "+protected+"/devstoreaccount1/upload/{id}", s.protect(s.handleUploadPut))
+	mux.HandleFunc("PUT "+protected+"/upload/{id}", s.protect(s.handleUploadPut))
+	mux.HandleFunc("GET "+protected+"/download/{id}", s.protect(s.handleDownload))
+	mux.HandleFunc("GET "+protected+"/gitmirror/{owner}/{repo}", s.protect(s.handleGitBundle))
+	mux.HandleFunc(protected+"/", s.protect(s.handleCatchAll))
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = io.WriteString(w, "ok")
 	})
-	mux.HandleFunc("/", s.handleCatchAll)
+	mux.HandleFunc("/", http.NotFound)
 	return s.logRequests(mux)
+}
+
+func (s *Server) protect(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.PathValue("token") != s.accessToken {
+			http.NotFound(w, r)
+			return
+		}
+		next(w, r)
+	}
 }
 
 // handleGitBundle streams a git bundle of the requested repo's host mirror
@@ -115,6 +168,10 @@ func (s *Server) handleGitBundle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	slug := r.PathValue("owner") + "/" + strings.TrimSuffix(r.PathValue("repo"), ".git")
+	if slug != s.gitBundlerRepo {
+		http.NotFound(w, r)
+		return
+	}
 	w.Header().Set("Content-Type", "application/octet-stream")
 	if err := s.gitBundler(r.Context(), slug, w); err != nil {
 		s.logger.Error("git bundle", "repo", slug, "err", err)
@@ -125,9 +182,16 @@ func (s *Server) handleGitBundle(w http.ResponseWriter, r *http.Request) {
 // logRequests logs each incoming request so cache traffic is observable.
 func (s *Server) logRequests(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		s.logger.Info("request", "method", r.Method, "path", r.URL.Path)
+		s.logger.Info("request", "method", r.Method, "path", s.redactPath(r.URL.Path))
 		next.ServeHTTP(w, r)
 	})
+}
+
+func (s *Server) redactPath(path string) string {
+	if prefix := s.accessPrefix(); strings.HasPrefix(path, prefix) {
+		return "/_mr/<redacted>" + strings.TrimPrefix(path, prefix)
+	}
+	return path
 }
 
 // runGC periodically evicts stale/oversized cache entries until ctx is cancelled.
@@ -161,7 +225,7 @@ func (s *Server) Start(ctx context.Context) error {
 	go s.runGC(ctx)
 	errCh := make(chan error, 1)
 	go func() {
-		s.logger.Info("cache server listening", "addr", s.httpSrv.Addr, "advertise", s.advertiseURL)
+		s.logger.Info("cache server listening", "addr", s.httpSrv.Addr, "advertise", s.RedactedAdvertiseURL())
 		if err := s.httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- err
 		}
@@ -208,7 +272,7 @@ func (s *Server) handleCreateCacheEntry(w http.ResponseWriter, r *http.Request) 
 	}
 	writeJSON(w, map[string]any{
 		"ok":                true,
-		"signed_upload_url": fmt.Sprintf("%s/devstoreaccount1/upload/%d", s.baseURL(r), id),
+		"signed_upload_url": fmt.Sprintf("%s/devstoreaccount1/upload/%s", s.baseURL(r), s.signID("upload", strconv.FormatInt(id, 10))),
 	})
 }
 
@@ -219,7 +283,7 @@ func (s *Server) handleCreateCacheEntry(w http.ResponseWriter, r *http.Request) 
 // container reached via the host gateway. Falls back to the advertise URL.
 func (s *Server) baseURL(r *http.Request) string {
 	if r.Host == "" {
-		return s.advertiseURL
+		return s.AdvertiseURL()
 	}
 	scheme := "http"
 	if r.TLS != nil {
@@ -228,7 +292,7 @@ func (s *Server) baseURL(r *http.Request) string {
 	if p := r.Header.Get("X-Forwarded-Proto"); p != "" {
 		scheme = p
 	}
-	return scheme + "://" + r.Host
+	return scheme + "://" + r.Host + s.accessPrefix()
 }
 
 func (s *Server) handleGetDownloadURL(w http.ResponseWriter, r *http.Request) {
@@ -256,7 +320,7 @@ func (s *Server) handleGetDownloadURL(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, map[string]any{
 		"ok":                  true,
-		"signed_download_url": fmt.Sprintf("%s/download/%s", s.baseURL(r), entry.ID),
+		"signed_download_url": fmt.Sprintf("%s/download/%s", s.baseURL(r), s.signID("download", entry.ID)),
 		"matched_key":         entry.Key,
 	})
 }
@@ -296,7 +360,12 @@ func (s *Server) handleFinalize(w http.ResponseWriter, r *http.Request) {
 // ---- Azure block upload data plane ----
 
 func (s *Server) handleUploadPut(w http.ResponseWriter, r *http.Request) {
-	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	idStr, ok := s.verifySignedID("upload", r.PathValue("id"))
+	if !ok {
+		httpError(w, http.StatusForbidden, "invalid upload signature")
+		return
+	}
+	id, err := strconv.ParseInt(idStr, 10, 64)
 	if err != nil {
 		httpError(w, http.StatusBadRequest, "invalid upload id")
 		return
@@ -328,7 +397,12 @@ func (s *Server) handleUploadPut(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
-	rc, err := s.store.openDownload(r.Context(), r.PathValue("id"))
+	id, ok := s.verifySignedID("download", r.PathValue("id"))
+	if !ok {
+		httpError(w, http.StatusForbidden, "invalid download signature")
+		return
+	}
+	rc, err := s.store.openDownload(r.Context(), id)
 	if errors.Is(err, os.ErrNotExist) {
 		httpError(w, http.StatusNotFound, "cache entry not found")
 		return
@@ -348,6 +422,14 @@ func (s *Server) handleCatchAll(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusNotFound, "not found")
 		return
 	}
+	if prefix := s.accessPrefix(); strings.HasPrefix(r.URL.Path, prefix+"/") {
+		clone := r.Clone(r.Context())
+		clone.URL.Path = strings.TrimPrefix(r.URL.Path, prefix)
+		if clone.URL.Path == "" {
+			clone.URL.Path = "/"
+		}
+		r = clone
+	}
 	s.logger.Debug("proxying to upstream", "method", r.Method, "path", r.URL.Path)
 	s.proxy.ServeHTTP(w, r)
 }
@@ -364,10 +446,9 @@ type scopeEntry struct {
 	Permission int    `json:"Permission"`
 }
 
-// scopeOrError extracts cache scopes from the bearer token. With validation
-// skipped (default, since we own the runners) the JWT is decoded but not
-// verified. A token without scopes falls back to a permissive default so
-// non-Actions clients still work.
+// scopeOrError extracts cache scopes from the bearer token. The private URL
+// prefix gates access to this service; skipValidation controls whether an
+// Actions bearer token with cache scopes is also required.
 func (s *Server) scopeOrError(w http.ResponseWriter, r *http.Request) (scopeInfo, bool) {
 	auth := r.Header.Get("Authorization")
 	token := strings.TrimPrefix(auth, "Bearer ")
@@ -375,6 +456,13 @@ func (s *Server) scopeOrError(w http.ResponseWriter, r *http.Request) (scopeInfo
 		token = ""
 	}
 	info := parseScopes(token)
+	if !s.skipValidation {
+		if token == "" || len(info.scopes) == 0 || info.repoID == "" {
+			httpError(w, http.StatusUnauthorized, "missing or invalid cache token")
+			return scopeInfo{}, false
+		}
+		return info, true
+	}
 	if len(info.scopes) == 0 {
 		info.scopes = []scopeEntry{{Scope: "default", Permission: 3}}
 	}
@@ -466,3 +554,40 @@ func newRequestID() string {
 }
 
 func nowMillis() int64 { return time.Now().UnixMilli() }
+
+func randomToken() (string, error) {
+	var b [32]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(b[:]), nil
+}
+
+func (s *Server) signID(kind, id string) string {
+	exp := strconv.FormatInt(time.Now().Add(2*time.Hour).Unix(), 10)
+	mac := hmac.New(sha256.New, []byte(s.accessToken))
+	_, _ = io.WriteString(mac, kind+"\n"+id+"\n"+exp)
+	return id + "." + exp + "." + hex.EncodeToString(mac.Sum(nil))
+}
+
+func (s *Server) verifySignedID(kind, signed string) (string, bool) {
+	parts := strings.Split(signed, ".")
+	if len(parts) != 3 {
+		return "", false
+	}
+	id, exp, gotHex := parts[0], parts[1], parts[2]
+	until, err := strconv.ParseInt(exp, 10, 64)
+	if err != nil || time.Now().Unix() > until {
+		return "", false
+	}
+	got, err := hex.DecodeString(gotHex)
+	if err != nil {
+		return "", false
+	}
+	mac := hmac.New(sha256.New, []byte(s.accessToken))
+	_, _ = io.WriteString(mac, kind+"\n"+id+"\n"+exp)
+	if !hmac.Equal(got, mac.Sum(nil)) {
+		return "", false
+	}
+	return id, true
+}
