@@ -120,6 +120,60 @@ func TestCreateRegistrationToken(t *testing.T) {
 	}
 }
 
+func TestDeleteRunner(t *testing.T) {
+	var gotMethod, gotPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod, gotPath = r.Method, r.URL.Path
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+
+	c := newTestClient(t, srv, config.ScopeOrg, "myorg", "")
+	if err := c.DeleteRunner(context.Background(), 42); err != nil {
+		t.Fatalf("DeleteRunner: %v", err)
+	}
+	if gotMethod != http.MethodDelete {
+		t.Errorf("method = %s", gotMethod)
+	}
+	if gotPath != "/orgs/myorg/actions/runners/42" {
+		t.Errorf("path = %s", gotPath)
+	}
+}
+
+func TestQueuedJobLabels(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/repos/octo/hello/actions/runs":
+			if r.URL.Query().Get("status") != "queued" {
+				t.Errorf("status query = %q", r.URL.Query().Get("status"))
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"workflow_runs": []map[string]any{{"id": 101}},
+			})
+		case "/repos/octo/hello/actions/runs/101/jobs":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"jobs": []map[string]any{
+					{"status": "queued", "labels": []string{"self-hosted", "linux", "x64"}},
+					{"status": "completed", "labels": []string{"self-hosted", "windows"}},
+				},
+			})
+		default:
+			t.Errorf("unexpected path = %s", r.URL.String())
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	c := newTestClient(t, srv, config.ScopeRepo, "octo", "hello")
+	labels, err := c.QueuedJobLabels(context.Background())
+	if err != nil {
+		t.Fatalf("QueuedJobLabels: %v", err)
+	}
+	if len(labels) != 1 || len(labels[0]) != 3 || labels[0][1] != "linux" {
+		t.Fatalf("labels = %#v", labels)
+	}
+}
+
 func TestPATTransportSetsAuth(t *testing.T) {
 	var gotAuth string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

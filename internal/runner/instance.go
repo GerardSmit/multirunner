@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"time"
 
 	"github.com/docker/docker/pkg/stdcopy"
 
@@ -65,8 +66,17 @@ func RunOnce(ctx context.Context, gh *github.Client, be backend.Backend, spec Sp
 	cancelLogs()
 
 	if ctx.Err() != nil {
-		// Shutdown: terminate the in-flight runner with a detached context.
-		_ = handle.Kill(context.WithoutCancel(ctx))
+		// Shutdown: terminate the in-flight runner and deregister it from GitHub
+		// with a detached, bounded context (the job ctx is already cancelled).
+		detached, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		defer cancel()
+		_ = handle.Kill(detached)
+		if jit.Runner.ID != 0 {
+			if err := gh.DeleteRunner(detached, jit.Runner.ID); err != nil {
+				logger.Warn("deregister runner on shutdown failed",
+					"name", spec.Name, "runner_id", jit.Runner.ID, "err", err)
+			}
+		}
 		return code, ctx.Err()
 	}
 	if waitErr != nil {

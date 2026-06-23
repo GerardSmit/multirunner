@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -146,26 +147,79 @@ func (c *Client) CreateRegistrationToken(ctx context.Context) (string, error) {
 	return out.Token, nil
 }
 
-// CountQueuedRuns returns the number of queued workflow runs (a proxy for queued
-// jobs) for repo scope. Org/enterprise scope returns 0 (no cheap REST endpoint;
-// use webhook mode there).
-func (c *Client) CountQueuedRuns(ctx context.Context) (int, error) {
-	if c.scope != config.ScopeRepo {
-		return 0, nil
+// DeleteRunner removes a runner registration from GitHub by ID. Ephemeral
+// runners self-remove after their one job; this is the explicit cleanup path
+// for runners terminated mid-job on shutdown.
+func (c *Client) DeleteRunner(ctx context.Context, runnerID int64) error {
+	path, err := c.runnersPath(strconv.FormatInt(runnerID, 10))
+	if err != nil {
+		return err
 	}
-	path := fmt.Sprintf("repos/%s/%s/actions/runs?status=queued&per_page=1",
+	req, err := c.gh.NewRequest(http.MethodDelete, path, nil)
+	if err != nil {
+		return fmt.Errorf("build delete-runner request: %w", err)
+	}
+	if _, err := c.gh.Do(ctx, req, nil); err != nil {
+		return fmt.Errorf("delete-runner %d (%s): %w", runnerID, c.scope, err)
+	}
+	return nil
+}
+
+// QueuedJobLabels returns the requested labels for queued workflow jobs in repo
+// scope. Org/enterprise scope returns nil (no cheap REST endpoint; use webhook
+// mode there).
+func (c *Client) QueuedJobLabels(ctx context.Context) ([][]string, error) {
+	if c.scope != config.ScopeRepo {
+		return nil, nil
+	}
+	path := fmt.Sprintf("repos/%s/%s/actions/runs?status=queued&per_page=20",
 		url.PathEscape(c.owner), url.PathEscape(c.repo))
 	req, err := c.gh.NewRequest(http.MethodGet, path, nil)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 	var out struct {
-		TotalCount int `json:"total_count"`
+		WorkflowRuns []struct {
+			ID int64 `json:"id"`
+		} `json:"workflow_runs"`
 	}
 	if _, err := c.gh.Do(ctx, req, &out); err != nil {
-		return 0, fmt.Errorf("list queued runs: %w", err)
+		return nil, fmt.Errorf("list queued runs: %w", err)
 	}
-	return out.TotalCount, nil
+	var labels [][]string
+	for _, run := range out.WorkflowRuns {
+		jobs, err := c.queuedJobsForRun(ctx, run.ID)
+		if err != nil {
+			return nil, err
+		}
+		labels = append(labels, jobs...)
+	}
+	return labels, nil
+}
+
+func (c *Client) queuedJobsForRun(ctx context.Context, runID int64) ([][]string, error) {
+	path := fmt.Sprintf("repos/%s/%s/actions/runs/%d/jobs?filter=latest&per_page=100",
+		url.PathEscape(c.owner), url.PathEscape(c.repo), runID)
+	req, err := c.gh.NewRequest(http.MethodGet, path, nil)
+	if err != nil {
+		return nil, err
+	}
+	var out struct {
+		Jobs []struct {
+			Status string   `json:"status"`
+			Labels []string `json:"labels"`
+		} `json:"jobs"`
+	}
+	if _, err := c.gh.Do(ctx, req, &out); err != nil {
+		return nil, fmt.Errorf("list workflow jobs: %w", err)
+	}
+	labels := make([][]string, 0, len(out.Jobs))
+	for _, job := range out.Jobs {
+		if job.Status == "queued" {
+			labels = append(labels, job.Labels)
+		}
+	}
+	return labels, nil
 }
 
 // Scope reports the configured scope.
